@@ -8,6 +8,7 @@ from asyncio import Future, Task, sleep
 from collections.abc import Awaitable, Callable, Coroutine
 from functools import wraps
 from typing import Any, TypeVar, overload
+import os
 
 from .ffi import IN_BROWSER, can_run_sync, create_once_callable, run_sync
 
@@ -209,9 +210,23 @@ class WebLoop(asyncio.AbstractEventLoop):
         self._no_in_progress_handler = None
         self._keyboard_interrupt_handler = None
         self._system_exit_handler = None
+        env_debug = os.environ.get('PYTHONASYNCIODEBUG', '').strip()
+        dev_mode = getattr(sys.flags, 'dev_mode', False)
+        self._debug = bool(env_debug) or dev_mode
 
     def get_debug(self):
-        return False
+        """Return ``True`` if the event loop is in debug mode.
+    
+        Debug mode is enabled if:
+        - PYTHONASYNCIODEBUG environment variable is set to non-empty string
+        - Python development mode is active (Python 3.7+)
+        - Explicitly enabled via set_debug(True)
+        """
+        return self._debug  
+    
+    def set_debug(self, enabled: bool) -> None:
+        """Set the debug mode of the event loop."""
+        self._debug = bool(enabled)
 
     #
     # Lifecycle methods: We ignore all lifecycle management
