@@ -9,6 +9,8 @@ from collections.abc import Awaitable, Callable, Coroutine
 from functools import wraps
 from typing import Any, TypeVar, overload
 import os
+import weakref
+import warnings
 
 from .ffi import IN_BROWSER, can_run_sync, create_once_callable, run_sync
 
@@ -214,6 +216,17 @@ class WebLoop(asyncio.AbstractEventLoop):
         dev_mode = getattr(sys.flags, 'dev_mode', False)
         self._debug = bool(env_debug) or dev_mode
 
+        # Async generator management for proper resource cleanup
+        # Similar to BaseEventLoop but with browser-specific lifecycle
+        self._asyncgens = weakref.WeakSet()  # Track active async generators
+        self._asyncgens_shutdown_called = False  # Prevent new generators after shutdown
+        self._old_agen_hooks = None  # Store original async generator hooks
+        
+        # Install hooks immediately in browser environment
+        # Unlike BaseEventLoop which installs in run_forever_setup(),
+        # WebLoop has no explicit start phase so hooks are installed at creation
+        self._install_asyncgen_hooks()
+
     def get_debug(self):
         """Return ``True`` if the event loop is in debug mode.
     
@@ -227,6 +240,126 @@ class WebLoop(asyncio.AbstractEventLoop):
     def set_debug(self, enabled: bool) -> None:
         """Set the debug mode of the event loop."""
         self._debug = bool(enabled)
+
+    #
+    # Async generator management: Track and clean up async generators
+    # for proper resource management in browser environments
+    #
+
+    def _asyncgen_firstiter_hook(self, agen):
+        """Called when an async generator starts iteration.
+        
+        Tracks new async generators and issues warnings if they're created
+        after shutdown_asyncgens() has been called. This prevents resource
+        leaks in browser environments where generators may not be properly
+        closed during page navigation.
+        """
+        if self._asyncgens_shutdown_called:
+            warnings.warn(
+                f"asynchronous generator {agen!r} was scheduled after "
+                f"loop.shutdown_asyncgens() call",
+                ResourceWarning, source=self
+            )
+            return  # Don't track generators created after shutdown
+        
+        self._asyncgens.add(agen)  
+
+    def _asyncgen_finalizer_hook(self, agen):
+        """Called when an async generator is being finalized.
+        
+        Removes the generator from tracking and schedules its cleanup.
+        In browser environment, uses call_soon directly since everything
+        runs on the main thread.
+        """
+        self._asyncgens.discard(agen)  # Remove from tracking set
+
+        if not self.is_closed():
+            self.call_soon(lambda: self.create_task(agen.aclose()))
+
+    def _install_asyncgen_hooks(self):
+        """Install async generator hooks to track generators.
+        
+        This is called during WebLoop initialization to ensure
+        all async generators are properly tracked. Unlike BaseEventLoop
+        which installs hooks during run_forever(), WebLoop does this
+        immediately since there's no explicit start phase in browser environment.
+        """
+        if self._old_agen_hooks is not None:
+            return  # Already installed
+            
+        self._old_agen_hooks = sys.get_asyncgen_hooks()
+        sys.set_asyncgen_hooks(
+            firstiter=self._asyncgen_firstiter_hook,
+            finalizer=self._asyncgen_finalizer_hook
+        )
+
+    def _restore_asyncgen_hooks(self):
+        """Restore original async generator hooks.
+        
+        This is called when the event loop is being closed to restore
+        the original async generator hooks that were active before
+        WebLoop installation.
+        """
+        if self._old_agen_hooks is None:
+            return  # Not installed
+            
+        try:
+            sys.set_asyncgen_hooks(*self._old_agen_hooks)
+        finally:
+            self._old_agen_hooks = None
+
+    async def shutdown_asyncgens(self, *, timeout: float | None = None) -> None:
+        """Shutdown all active async generators.
+        
+        This closes all tracked async generators and prevents new ones
+        from being created. Essential for proper resource cleanup in browser
+        environments where generators may hold network connections, file handles,
+        or other resources that need explicit cleanup.
+        
+        Args:
+            timeout: Maximum time to wait for generators to close. If None,
+                    waits indefinitely. In browser environments, a timeout
+                    helps prevent hanging during page navigation.
+        """
+        self._asyncgens_shutdown_called = True
+
+        closing_asyncgens = list(self._asyncgens)
+        if not closing_asyncgens:
+            return
+
+        # Close all async generators concurrently
+        coros = [ag.aclose() for ag in closing_asyncgens]
+        
+        try:
+            if timeout is None:
+                results = await asyncio.gather(*coros, return_exceptions=True)
+            else:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*coros, return_exceptions=True),
+                    timeout=timeout
+                )
+        except asyncio.TimeoutError:
+            self.call_exception_handler({
+                "message": "shutdown_asyncgens() timed out",
+                "asyncgens_left": len(closing_asyncgens),
+            })
+            return
+
+        # Log any exceptions that occurred during closure
+        for result, agen in zip(results, closing_asyncgens):
+            if isinstance(result, Exception):
+                self.call_exception_handler({
+                    "message": (f"an error occurred during closing of "
+                                f"asynchronous generator {agen!r}"),
+                    "exception": result,
+                    "asyncgen": agen,
+                })
+
+        self._asyncgens.clear()
+
+    async def shutdown_default_executor(self, timeout=None) -> None:
+        """Schedule the shutdown of the default executor."""
+        pass
 
     #
     # Lifecycle methods: We ignore all lifecycle management
@@ -247,8 +380,12 @@ class WebLoop(asyncio.AbstractEventLoop):
         return False
 
     def close(self) -> None:
-        """Ignore request to close WebLoop"""
-        pass
+        """Close the event loop and clean up resources.
+        
+        This restores the original async generator hooks and ensures
+        proper cleanup when the event loop is no longer needed.
+        """
+        self._restore_asyncgen_hooks()
 
     def _check_closed(self):
         """Used in create_task.
