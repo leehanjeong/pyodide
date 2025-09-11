@@ -324,6 +324,8 @@ class WebLoop(asyncio.AbstractEventLoop):
         self._asyncgens_shutdown_called = True
 
         closing_asyncgens = list(self._asyncgens)
+        self._asyncgens.clear()
+        
         if not closing_asyncgens:
             return
 
@@ -355,8 +357,6 @@ class WebLoop(asyncio.AbstractEventLoop):
                     "asyncgen": agen,
                 })
 
-        self._asyncgens.clear()
-
     async def shutdown_default_executor(self, timeout=None) -> None:
         """Schedule the shutdown of the default executor."""
         pass
@@ -382,10 +382,29 @@ class WebLoop(asyncio.AbstractEventLoop):
     def close(self) -> None:
         """Close the event loop and clean up resources.
         
-        This restores the original async generator hooks and ensures
-        proper cleanup when the event loop is no longer needed.
+        Warns if there are pending async generators that haven't been
+        properly shut down via shutdown_asyncgens(). Restores the original
+        async generator hooks to their pre-WebLoop state.
+        
+        Note: WebLoop doesn't manage run/stop lifecycle, so this only
+        handles async generator cleanup.
         """
-        self._restore_asyncgen_hooks()
+        # Warn about pending async generators if shutdown wasn't called
+        if (hasattr(self, "_asyncgens") and len(self._asyncgens) > 0 
+            and not getattr(self, "_asyncgens_shutdown_called", False)):
+            warnings.warn(
+                "Event loop closed with pending async generators; "
+                "call loop.shutdown_asyncgens() before close().",
+                ResourceWarning,
+                source=self,
+            )
+
+        # Always restore hooks, even if exceptions occur
+        try:
+            self._restore_asyncgen_hooks()
+        finally:
+            if hasattr(self, "_asyncgens"):
+                self._asyncgens.clear()
 
     def _check_closed(self):
         """Used in create_task.
