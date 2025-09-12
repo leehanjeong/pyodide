@@ -23,7 +23,7 @@ async def test_shutdown_closes_partially_consumed(selenium):
     async def agen():
         try:
             yield 1
-            await asyncio.sleep(0.1) 
+            await asyncio.sleep(0) 
             yield 2
         finally:
             closed.append("closed")
@@ -134,7 +134,7 @@ async def test_multiple_generators_closed(selenium):
     async def agen(name):
         try:
             yield f"{name}_value"
-            await asyncio.sleep(0.1) 
+            await asyncio.sleep(0) 
             yield f"{name}_done"
         finally:
             closed.append(f"{name}_closed")
@@ -337,3 +337,26 @@ async def test_debug_mode_integration(selenium):
     finally:
         # Restore original debug setting
         loop.set_debug(original_debug)
+
+@run_in_pyodide
+async def test_shutdown_timeout_logs(selenium):
+    import asyncio
+    loop = asyncio.get_running_loop()
+    loop._asyncgens_shutdown_called = False
+    loop._asyncgens.clear()
+
+    logs = []
+    loop.set_exception_handler(lambda l, c: logs.append(c.get("message", "")))
+
+    async def slow_agen():
+        try:
+            yield 1
+        finally:
+            # aclose()에서 오래 대기
+            await asyncio.sleep(999)
+
+    a = slow_agen()
+    assert await a.__anext__() == 1
+
+    await loop.shutdown_asyncgens(timeout=0.01)
+    assert any("timed out" in (m or "").lower() for m in logs)
